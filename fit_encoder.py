@@ -20,8 +20,8 @@ from dataclasses import dataclass
 from struct import pack
 from typing import List
 
-from definitions import MANUFACTURER, PRODUCT, SPORT, SEGMENT_LEADERBOARD_TYPE
-from profile import Record, get_message, Crc
+from .definitions import MANUFACTURER, PRODUCT, SPORT, SEGMENT_LEADERBOARD_TYPE
+from .profile import Record, get_message, Crc
 
 
 @dataclass

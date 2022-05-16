@@ -22,7 +22,7 @@ from functools import reduce
 from struct import pack
 from typing import List
 
-from definitions import FIT_BASE_TYPES
+from .definitions import FIT_BASE_TYPES
 
 # According to the SDK date_time type is computed counting the seconds since this datetime: UTC 00:00 Dec 31 1989
 date_time_seconds_since = datetime(1989, 12, 31, 0, 0, 0).timestamp()
