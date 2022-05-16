@@ -1,42 +1,27 @@
+"""
+Copyright (C) 2020 Román Ginés Martínez Ferrández <rgmf@riseup.net>.
+
+This file is part of fit-segment-encoder.
+
+fit-segment-encoder is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+any later version.
+
+fit-segment-encoder is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with fit-segment-encoder. If not, see <https://www.gnu.org/licenses/>.
+"""
 from dataclasses import dataclass
-from datetime import datetime
-from enum import Enum
-from functools import reduce
-from typing import List
 from struct import pack
+from typing import List
 
-from profile import Record
-
-
-class LeaderType(str, Enum):
-    OVERALL = "overall"
-    PERSONAL_BEST = "personal_best"
-
-
-@dataclass
-class FileId:
-    serial_number: int
-    time_created: int
-    manufacturer: str
-    type: str = "segment"
-
-
-@dataclass
-class SegmentId:
-    name: str
-    sport: str
-    enabled: bool
-
-
-@dataclass
-class SegmentLeaderboardEntry:
-    message_index: int
-    segment_time: int
-    leader_type: LeaderType
-    name: str = None
-    activity_id: int = None
-    activity_id_string: str = None
-    group_primary_key: int = None
+from definitions import MANUFACTURER, PRODUCT, SPORT, SEGMENT_LEADERBOARD_TYPE
+from profile import Record, get_message, Crc
 
 
 @dataclass
@@ -44,10 +29,99 @@ class SegmentPoint:
     message_index: int
     latitude: int
     longitude: int
-    distance: float
-    altitude: float
+    distance: int
+    altitude: int
     best_time: int = None
     leader_time: int = None
+
+
+class AscentDescentManager:
+    """Smooth the elevation ascent and descent noise."""
+
+    # Ignore differences of DIFF_THRESHOLD between two consecutive altitudes.
+    DIFF_THRESHOLD = 5
+    # Elevation accumulation threshold to add ascent or descent.
+    ACCUM_THRESHOLD = 0.5
+
+    def __init__(self):
+        self._last_altitude = None
+
+        self._ascent_accum: int = 0
+        self._ascent: int = 0
+        self._descent_accum: int = 0
+        self._descent: int = 0
+
+        self._total_ascent: int = 0
+        self._total_descent: int = 0
+
+    def add(self, altitude):
+        if self._last_altitude is None:
+            self._last_altitude = altitude
+            return
+
+        if altitude is None:
+            return
+
+        diff = abs(self._last_altitude - altitude)
+
+        if diff > AscentDescentManager.DIFF_THRESHOLD:
+            self._last_altitude = altitude
+            self._ascent_accum = self._descent_accum = 0
+            return
+
+        if self._last_altitude < altitude:
+            self._ascent_accum += diff
+            self._descent_accum = 0
+            if self._ascent_accum > AscentDescentManager.ACCUM_THRESHOLD:
+                self._ascent += self._ascent_accum
+                self._ascent_accum = 0
+        elif self._last_altitude > altitude:
+            self._descent_accum += diff
+            self._ascent_accum = 0
+            if self._descent_accum > AscentDescentManager.ACCUM_THRESHOLD:
+                self._descent += self._descent_accum
+                self._descent_accum = 0
+        else:
+            self._ascent_accum = self._descent_accum = 0
+
+        self._last_altitude = altitude
+
+    def get_and_reset(self):
+        ascent, descent = self._ascent, self._descent
+        self._ascent = self._descent = 0
+        self._total_ascent += ascent
+        self._total_descent += descent
+        return ascent, descent
+
+
+@dataclass
+class SegmentLeader:
+    type: int
+    segment_time: int
+    name: str = None
+    activity_id: int = None
+    activity_id_string: str = None
+    group_primary_key: int = None
+
+
+@dataclass
+class SegmentBytes:
+    file_id: bytes = b""
+    file_creator: bytes = b""
+    segment_id: bytes = b""
+    segment_leaderboard_entry: bytes = b""
+    segment_lap: bytes = b""
+    segment_point: bytes = b""
+
+    def get(self):
+        return (
+            self.file_id +
+            self.file_creator +
+            self.segment_id +
+            self.segment_leaderboard_entry +
+            self.segment_lap +
+            self.segment_point
+        )
 
 
 class FitSegmentEncoder:
@@ -62,30 +136,94 @@ class FitSegmentEncoder:
     - Several segment_point messages.
     """
 
-    # According to the SDK date_time is computed counting the seconds since this datetime: UTC 00:00 Dec 31 1989
-    date_time_seconds_since = datetime(1989, 12, 31, 0, 0, 0).timestamp()
+    def __init__(self, name: str, sport: int, segment_points: List[SegmentPoint]):
+        self._bytes = SegmentBytes()
 
-    def __init__(self, name: str, sport: str):
-        self._data_bytes = b""
+        self._name = name
+        self._sport = sport
+        self._segment_points = segment_points
 
-        self._segment_id = SegmentId(name, sport, True)
-        self._leaderboards: List[SegmentLeaderboardEntry] = []
+        self._leaders: List[SegmentLeader] = []
+
+        manager = AscentDescentManager()
 
         self._encode_message_file_id()
         self._encode_message_file_creator()
+        self._encode_message_segment_id()
+        for idx, sp in enumerate(self._segment_points):
+            manager.add(sp.altitude)
+            self._encode_message_segment_point(sp, idx)
+        self._encode_message_segment_lap(manager)
 
     def _encode_message_file_id(self):
         """Encode the file_id message of type=segment."""
-        record = Record("file_id")
-        self._data_bytes += record.bytes
+        message = get_message("file_id")
+        message.set_field_value("manufacturer", MANUFACTURER["garmin"])
+        message.set_field_value("product", PRODUCT["edge_530"])
+        record = Record(message)
+        self._bytes.file_id = record.bytes
 
     def _encode_message_file_creator(self):
         """Encode the file_creator message."""
-        record = Record("file_creator")
-        self._data_bytes += record.bytes
+        record = Record(get_message("file_creator"))
+        self._bytes.file_creator = record.bytes
 
-    def add_leaderboard(self, segment_time: int, leader_type: LeaderType):
-        self._leaderboards.append(SegmentLeaderboardEntry(len(self._leaderboards), segment_time, leader_type))
+    def _encode_message_segment_id(self):
+        message = get_message("segment_id")
+        message.set_field_value("name", b"Segmento Prueba")
+        message.set_field_value("sport", SPORT["cycling"])
+        record = Record(message)
+        self._bytes.segment_id = record.bytes
+
+    def _encode_message_segment_lap(self, manager: AscentDescentManager):
+        ascent, descent = manager.get_and_reset()
+
+        message = get_message("segment_lap")
+        message.set_field_value("message_index", 0)
+        message.set_field_value("start_position_lat", self._segment_points[0].latitude)
+        message.set_field_value("start_position_long", self._segment_points[0].longitude)
+        message.set_field_value("end_position_lat", self._segment_points[-1].latitude)
+        message.set_field_value("end_position_long", self._segment_points[-1].longitude)
+        message.set_field_value("total_distance", self._segment_points[-1].distance)
+        message.set_field_value("total_ascent", ascent)
+        message.set_field_value("total_descent", descent)
+        message.set_field_value("sport", self._sport)
+        record = Record(message)
+        self._bytes.segment_lap = record.bytes
+
+    def _encode_message_segment_point(self, sp: SegmentPoint, idx: int):
+        message = get_message("segment_point")
+        message.set_field_value("message_index", idx)
+        message.set_field_value("position_lat", sp.latitude)
+        message.set_field_value("position_long", sp.longitude)
+        message.set_field_value("distance", sp.distance)
+        message.set_field_value("altitude", sp.altitude)
+        message.set_field_value("leader_time", sp.leader_time)
+        record = Record(message)
+        self._bytes.segment_point += record.bytes
+
+    @property
+    def _data_bytes(self):
+        return self._bytes.get()
+
+    def add_leader(self, leader: SegmentLeader):
+        message = get_message("segment_leaderboard_entry")
+        message.set_field_value("message_index", len(self._leaders))
+        message.set_field_value("type", leader.type)
+        message.set_field_value("segment_time", leader.segment_time)
+        if leader.name:
+            message.set_field_value("name", leader.name.encode())
+        if leader.activity_id:
+            message.set_field_value("activity_id", leader.activity_id)
+        if leader.activity_id_string:
+            message.set_field_value("activity_id_string", leader.activity_id_string.encode())
+        if leader.group_primary_key:
+            message.set_field_value("group_primary_key", leader.group_primary_key)
+        record = Record(message)
+
+        self._leaders.append(leader)
+
+        self._bytes.segment_leaderboard_entry += record.bytes
 
     def end_and_get(self):
         """Finish FIT segment binary encoded data and return it.
@@ -105,55 +243,3 @@ class FitSegmentEncoder:
         crc_pack = pack("H", crc_file.value)
 
         return header + self._data_bytes + crc_pack
-
-
-class Crc(object):
-    """FIT file CRC computation."""
-
-    CRC_TABLE = (
-        0x0000, 0xCC01, 0xD801, 0x1400, 0xF001, 0x3C00, 0x2800, 0xE401,
-        0xA001, 0x6C00, 0x7800, 0xB401, 0x5000, 0x9C01, 0x8801, 0x4400,
-    )
-
-    FMT = "H"
-
-    def __init__(self, value=0, byte_arr=None):
-        self.value = value
-        if byte_arr:
-            self.update(byte_arr)
-
-    def __repr__(self):
-        return "<%s %s>" % (self.__class__.__name__, self.value or "-")
-
-    def __str__(self):
-        return self.format(self.value)
-
-    def update(self, byte_arr):
-        """Read bytes and update the CRC computed."""
-        if byte_arr:
-            self.value = self.calculate(byte_arr, self.value)
-
-    @staticmethod
-    def format(value):
-        """Format CRC value to string."""
-        return "0x%04X" % value
-
-    @classmethod
-    def calculate(cls, byte_arr, crc=0):
-        """Compute CRC for input bytes."""
-        for byte in bytearray(byte_arr):
-            # Taken verbatim from FIT SDK docs
-            tmp = cls.CRC_TABLE[crc & 0xF]
-            crc = (crc >> 4) & 0x0FFF
-            crc = crc ^ tmp ^ cls.CRC_TABLE[byte & 0xF]
-
-            tmp = cls.CRC_TABLE[crc & 0xF]
-            crc = (crc >> 4) & 0x0FFF
-            crc = crc ^ tmp ^ cls.CRC_TABLE[(byte >> 4) & 0xF]
-        return crc
-
-
-if __name__ == '__main__':
-    with open("segment_class.fit", "wb") as fd:
-        encoder = FitSegmentEncoder("Nombre", "cycling")
-        fd.write(encoder.end_and_get())
