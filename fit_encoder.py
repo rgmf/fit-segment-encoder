@@ -170,8 +170,8 @@ class FitSegmentEncoder:
 
     def _encode_message_segment_id(self):
         message = get_message("segment_id")
-        message.set_field_value("name", b"Segmento Prueba")
-        message.set_field_value("sport", SPORT["cycling"])
+        message.set_field_value("name", self._name.encode())
+        message.set_field_value("sport", self._sport)
         record = Record(message)
         self._bytes.segment_id = record.bytes
 
